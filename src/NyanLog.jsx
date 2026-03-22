@@ -1,23 +1,17 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { supabase, isSupabaseConfigured } from "./lib/supabase";
 
-/* ── Storage polyfill for web (uses localStorage when window.storage is unavailable) ── */
-const storage = {
-  async get(key, _sync) {
-    if (typeof window === "undefined") return null;
-    if (window.storage?.get) {
-      try { return await window.storage.get(key, _sync); } catch (e) { }
-    }
-    const val = localStorage.getItem(key);
-    return val != null ? { value: val } : null;
-  },
-  async set(key, value, _sync) {
-    if (typeof window === "undefined") return;
-    if (window.storage?.set) {
-      try { await window.storage.set(key, value, _sync); return; } catch (e) { }
-    }
-    localStorage.setItem(key, value);
-  },
-};
+/* DB形式 → アプリ形式 */
+function dbToApp(row) {
+  return {
+    id: row.id,
+    careId: row.care_id,
+    timestamp: row.timestamp,
+    memo: row.memo || "",
+    largeSyringe: row.large_syringe || 0,
+    smallSyringe: row.small_syringe || 0,
+  };
+}
 
 const CARE_TYPES = [
   { id: "food", label: "ごはん", icon: "🍚", defaultInterval: 8 * 60 * 60 * 1000, btnLabel: "あげた！", color: "#E8A87C", hasSyringe: true },
@@ -26,7 +20,6 @@ const CARE_TYPES = [
   { id: "iron", label: "鉄剤", icon: "💊", defaultInterval: 24 * 60 * 60 * 1000, btnLabel: "あげた！", color: "#F2A3A3", hasSyringe: false },
 ];
 
-const STORAGE_KEY = "nyanlog-records-v2";
 const PRED_N = 7;
 
 function fmt(d) { return new Date(d).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }); }
@@ -105,32 +98,42 @@ export default function NyanLog() {
   /* Clock */
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 15000); return () => clearInterval(t); }, []);
 
+  const fetchRecords = useCallback(async () => {
+    if (!supabase) return [];
+    const { data, error } = await supabase
+      .from("records")
+      .select("*")
+      .order("timestamp", { ascending: false });
+    if (error) {
+      console.error("Supabase fetch error:", error);
+      return [];
+    }
+    return (data || []).map(dbToApp);
+  }, []);
+
   /* Load */
   useEffect(() => {
     (async () => {
       try {
-        const r = await storage.get(STORAGE_KEY, true);
-        if (r?.value) setRecords(JSON.parse(r.value));
-      } catch {}
+        const rows = await fetchRecords();
+        setRecords(rows);
+      } catch (e) {
+        console.error(e);
+      }
       setLoading(false);
     })();
-  }, []);
+  }, [fetchRecords]);
 
   /* Sync poll */
   useEffect(() => {
     const t = setInterval(async () => {
       try {
-        const r = await storage.get(STORAGE_KEY, true);
-        if (r?.value) setRecords(JSON.parse(r.value));
+        const rows = await fetchRecords();
+        setRecords(rows);
       } catch {}
     }, 20000);
     return () => clearInterval(t);
-  }, []);
-
-  const save = useCallback(async (next) => {
-    setRecords(next);
-    try { await storage.set(STORAGE_KEY, JSON.stringify(next), true); } catch (e) { console.error(e); }
-  }, []);
+  }, [fetchRecords]);
 
   /* Notification permission */
   useEffect(() => { if ("Notification" in window) setNotifPerm(Notification.permission); }, []);
@@ -154,18 +157,44 @@ export default function NyanLog() {
 
   /* Add record */
   const addRecord = async (careId) => {
+    if (!supabase) return;
     const care = CARE_TYPES.find(c => c.id === careId);
-    const rec = { careId, timestamp: Date.now(), memo: memos[careId] || "" };
-    if (care.hasSyringe) {
-      rec.largeSyringe = syringes[careId]?.large || 0;
-      rec.smallSyringe = syringes[careId]?.small || 0;
+    const row = {
+      care_id: careId,
+      timestamp: Date.now(),
+      memo: memos[careId] || "",
+      large_syringe: care.hasSyringe ? (syringes[careId]?.large || 0) : 0,
+      small_syringe: care.hasSyringe ? (syringes[careId]?.small || 0) : 0,
+    };
+    const { data, error } = await supabase.from("records").insert(row).select().single();
+    if (error) {
+      console.error("Supabase insert error:", error);
+      return;
     }
-    await save([rec, ...records]);
+    setRecords([dbToApp(data), ...records]);
     setMemos(m => ({ ...m, [careId]: "" }));
     if (care.hasSyringe) setSyringes(p => ({ ...p, [careId]: { large: 0, small: 0 } }));
   };
 
-  const deleteRecord = async (index) => { await save(records.filter((_, i) => i !== index)); };
+  const deleteRecord = async (recordId) => {
+    if (!supabase) return;
+    const { error } = await supabase.from("records").delete().eq("id", recordId);
+    if (error) {
+      console.error("Supabase delete error:", error);
+      return;
+    }
+    setRecords(records.filter(r => r.id !== recordId));
+  };
+
+  if (!isSupabaseConfigured()) return (
+    <div style={S.loadWrap}>
+      <div style={{ fontSize: 52 }}>🐱</div>
+      <p style={{ fontSize: 14, color: "#8B7355", fontFamily: "'Zen Maru Gothic', sans-serif", marginTop: 8, textAlign: "center", padding: "0 24px" }}>
+        Supabaseの設定が必要です。<br />
+        .env に VITE_SUPABASE_URL と VITE_SUPABASE_ANON_KEY を設定してください。
+      </p>
+    </div>
+  );
 
   if (loading) return (
     <div style={S.loadWrap}>
@@ -306,7 +335,7 @@ export default function NyanLog() {
                     {rec.memo && <span style={S.histSub}>💬 {rec.memo}</span>}
                   </div>
                 </div>
-                <button onClick={() => deleteRecord(i)} style={S.delBtn}>✕</button>
+                <button onClick={() => deleteRecord(rec.id)} style={S.delBtn}>✕</button>
               </div>
             );
           })}
